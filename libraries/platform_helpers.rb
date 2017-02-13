@@ -38,5 +38,18 @@ module CernerSplunk
         }
       }
     end
+
+    def default_users
+      {
+        splunk: {
+          linux: 'splunk',
+          windows: 'NT SERVICE\Splunkd'
+        },
+        universal_forwarder: {
+          linux: 'splunk',
+          windows: 'NT SERVICE\Splunkforwarder'
+        }
+      }
+    end
   end
 end

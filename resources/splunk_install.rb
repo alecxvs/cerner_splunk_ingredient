@@ -13,8 +13,8 @@ class SplunkInstall < ChefCompat::Resource
   property :version, String, required: true
   property :build, String, required: true
   property :install_dir, String, required: true, desired_state: false
-  property :user, String, default: lazy { node['current_user'] || package == :splunk ? 'splunk' : 'splunkforwarder' }
-  property :group, String, default: lazy { user }
+  property :user, String, default: lazy { default_users[package][node['os'].to_sym] }
+  property :group, String, default: lazy { current_group || user }
   property :base_url, String, default: 'https://download.splunk.com/products'
 
   default_action :install
@@ -90,8 +90,22 @@ class SplunkInstall < ChefCompat::Resource
         block { load_version_state }
       end if changed?
 
-      execute "chown -R #{user}:#{group} #{install_dir}" do
-        not_if { node['os'] == 'windows' || current_owner == user }
+      # If we're using a virtual account, make sure it exists first
+      nt_service_match = /^NT SERVICE\\(.+)$/.match(user)
+      powershell_script "Create service user #{user}" do
+        code "New-Service -Name \"#{nt_service_match[1]}\" -BinaryPathName \"#{splunk_bin_path + 'splunk.exe'}\" -StartupType Disabled"
+        only_if { CernerSplunk::PathHelpers.ftr_pathname(install_dir).exist? && nt_service_match }
+        notifies :run, 'powershell_script[Clean up temporary service]', :delayed
+      end
+
+      ruby_block "Give ownership of #{install_dir} to #{user}:#{group}" do
+        block { deep_change_ownership(install_dir, user, group) }
+      end
+
+      powershell_script 'Clean up temporary service' do
+        code "(Get-WmiObject win32_service -Filter \"name='#{nt_service_match[1]}'\").delete()"
+        only_if { CernerSplunk::PathHelpers.ftr_pathname(install_dir).exist? && nt_service_match }
+        action :nothing
       end
     end
   end
@@ -105,15 +119,18 @@ class SplunkInstall < ChefCompat::Resource
       system true
       manage_home true
       action :create
+      not_if { /^NT SERVICE/ =~ user }
     end
+    # NT SERVICE users are "Virtual Accounts" and can not be created.
 
     declare_resource(:group, group) do
       append true
       members user
       action :create
+      not_if { /\\None^/ =~ group }
       # The user is created in a group of the same name, so we can skip this step if the group isn't changed.
       only_if { group != user }
-    end
+    end if property_is_set? :group
 
     remote_file package_path.to_s do
       source package_url
@@ -234,10 +251,12 @@ class WindowsInstall < SplunkInstall
   action :install do
     super()
 
+    domain_user = /\\/ =~ user ? user : "#{::ENV['HOSTNAME']}\\#{user}"
+
     windows_package package_name do
       source package_path.to_s
       action :install
-      options 'LAUNCHSPLUNK=0 INSTALL_SHORTCUT=0 AGREETOLICENSE=Yes'
+      options "LOGON_USERNAME=\"#{domain_user}\" LAUNCHSPLUNK=0 INSTALL_SHORTCUT=0 AGREETOLICENSE=Yes"
     end if changed? :version, :build
 
     post_install
